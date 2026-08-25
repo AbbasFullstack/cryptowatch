@@ -1,6 +1,7 @@
 'use client';
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect, react-hooks/static-components -- this existing client chart intentionally updates from asynchronous Binance data and uses a Recharts tooltip callback. */
 import { useEffect, useState } from 'react';
-import { useParams, useSearchParams, useRouter } from 'next/navigation';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { ArrowLeft, TrendingUp, TrendingDown, Activity } from 'lucide-react';
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts';
 
@@ -17,7 +18,6 @@ const INTERVALS = [
 ];
 
 export default function CoinPage() {
-  const params = useParams();
   const searchParams = useSearchParams();
   const router = useRouter();
   const symbol = (searchParams.get('symbol') || 'BTC').toUpperCase();

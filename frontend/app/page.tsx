@@ -1,362 +1,116 @@
 'use client';
-import { useEffect, useState, useRef } from 'react';
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/set-state-in-effect -- state updates originate from asynchronous auth, HTTP, and WebSocket subscriptions. */
+
+import { useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { supabase } from '@/lib/supabase';
-import { TrendingUp, LogOut, Star, Trash2, LogIn, BarChart3, Sparkles } from 'lucide-react';
+import { Activity, ArrowRight, ArrowUpDown, BarChart3, CircleAlert, LogIn, LogOut, Network, RefreshCw, Search, ShieldCheck, Sparkles, Star, TrendingDown, TrendingUp, Trash2 } from 'lucide-react';
 
-interface Coin {
-  id: string;
-  name: string;
-  symbol: string;
-  price: number;
-  changePct: number;
-}
+interface Coin { id: string; name: string; symbol: string; price: number; changePct: number; }
+interface WatchItem { id: string; coin_id: string; name: string; symbol: string; }
+type Status = 'connecting' | 'live' | 'reconnecting' | 'offline';
+type SortKey = 'rank' | 'price-high' | 'price-low' | 'change-high' | 'change-low';
 
-interface WatchItem {
-  id: string;
-  coin_id: string;
-  name: string;
-  symbol: string;
-}
+const sortLabels: Record<SortKey, string> = { rank: 'Market rank', 'price-high': 'Price: high to low', 'price-low': 'Price: low to high', 'change-high': '24h: highest first', 'change-low': '24h: lowest first' };
 
 export default function Home() {
   const [user, setUser] = useState<any>(null);
   const [coins, setCoins] = useState<Coin[]>([]);
   const [watchlist, setWatchlist] = useState<WatchItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [listLive, setListLive] = useState(false);
+  const [marketError, setMarketError] = useState('');
+  const [status, setStatus] = useState<Status>('connecting');
   const [streamSymbols, setStreamSymbols] = useState<string[]>([]);
-  const pendingRef = useRef<Record<string, Partial<Coin>>>({});
+  const [query, setQuery] = useState('');
+  const [sortBy, setSortBy] = useState<SortKey>('rank');
+  const pending = useRef<Record<string, Partial<Coin>>>({});
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      setUser(data.session?.user ?? null);
-    });
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => {
-      setUser(session?.user ?? null);
-    });
-    return () => sub.subscription.unsubscribe();
+    supabase.auth.getSession().then(({ data }) => setUser(data.session?.user ?? null));
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => setUser(session?.user ?? null));
+    return () => subscription.subscription.unsubscribe();
   }, []);
 
-  useEffect(() => {
-    const fetchCoins = async () => {
-      try {
-        const res = await fetch('https://api.coinpaprika.com/v1/tickers?quotes=USD&limit=20');
-        const data = await res.json();
-        if (Array.isArray(data)) {
-          const list = data.map((c: any) => ({
-            id: c.id,
-            name: c.name,
-            symbol: (c.symbol || '').toLowerCase(),
-            price: c.quotes?.USD?.price || 0,
-            changePct: c.quotes?.USD?.percent_change_24h || 0,
-          }));
-          setCoins(list);
-          setStreamSymbols(prev => prev.length === 0 ? list.map((c: Coin) => c.symbol) : prev);
-        }
-      } catch {}
-      setLoading(false);
-    };
-    fetchCoins();
-  }, []);
+  const loadCoins = async () => {
+    setLoading(true); setMarketError('');
+    try {
+      const response = await fetch('https://api.coinpaprika.com/v1/tickers?quotes=USD&limit=20');
+      if (!response.ok) throw new Error();
+      const source = await response.json();
+      if (!Array.isArray(source)) throw new Error();
+      const list = source.map((coin: any) => ({ id: coin.id, name: coin.name, symbol: (coin.symbol || '').toLowerCase(), price: coin.quotes?.USD?.price || 0, changePct: coin.quotes?.USD?.percent_change_24h || 0 }));
+      setCoins(list); setStreamSymbols((current) => current.length ? current : list.map((coin: Coin) => coin.symbol));
+    } catch { setMarketError('Market data could not load. Check your connection and try again.'); }
+    finally { setLoading(false); }
+  };
+
+  useEffect(() => { void loadCoins(); }, []);
 
   useEffect(() => {
-    if (streamSymbols.length === 0) return;
-    let ws: WebSocket | null = null;
-    let cancelled = false;
-
-    const setup = async () => {
+    if (!streamSymbols.length) return;
+    let closed = false; let socket: WebSocket | null = null; let attempts = 0; let timer: ReturnType<typeof setTimeout> | null = null;
+    const connect = async () => {
+      setStatus(attempts ? 'reconnecting' : 'connecting');
       try {
-        let valid: Set<string>;
         const cached = sessionStorage.getItem('binance_symbols');
-        if (cached) {
-          valid = new Set(JSON.parse(cached));
-        } else {
-          const res = await fetch('https://api.binance.com/api/v3/exchangeInfo');
-          const info = await res.json();
-          valid = new Set(
-            info.symbols
-              .filter((s: any) => s.quoteAsset === 'USDT' && s.status === 'TRADING')
-              .map((s: any) => s.baseAsset)
-          );
+        let valid = cached ? new Set(JSON.parse(cached)) : null;
+        if (!valid) {
+          const response = await fetch('https://api.binance.com/api/v3/exchangeInfo');
+          if (!response.ok) throw new Error();
+          const source = await response.json();
+          valid = new Set(source.symbols.filter((item: any) => item.quoteAsset === 'USDT' && item.status === 'TRADING').map((item: any) => item.baseAsset));
           sessionStorage.setItem('binance_symbols', JSON.stringify([...valid]));
         }
-        if (cancelled) return;
-
-        const streams = streamSymbols
-          .filter(s => valid.has(s.toUpperCase()))
-          .map(s => `${s.toLowerCase()}usdt@miniTicker`);
-        if (streams.length === 0) return;
-
-        ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams.join('/')}`);
-        ws.onopen = () => setListLive(true);
-        ws.onclose = () => setListLive(false);
-        ws.onerror = () => setListLive(false);
-        ws.onmessage = (e) => {
-          try {
-            const d = JSON.parse(e.data).data;
-            if (!d || !d.s) return;
-            const sym = d.s.replace(/USDT$/i, '').toLowerCase();
-            const price = parseFloat(d.c);
-            const open = parseFloat(d.o);
-            pendingRef.current[sym] = {
-              price,
-              changePct: open > 0 ? ((price - open) / open) * 100 : 0,
-            };
-          } catch {}
-        };
-      } catch {}
+        const streams = streamSymbols.filter((symbol) => valid!.has(symbol.toUpperCase())).map((symbol) => `${symbol}usdt@miniTicker`);
+        if (!streams.length) { setStatus('offline'); return; }
+        socket = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${streams.join('/')}`);
+        socket.onopen = () => { attempts = 0; setStatus('live'); };
+        socket.onerror = () => setStatus('offline');
+        socket.onmessage = (event) => { try { const data = JSON.parse(event.data).data; const symbol = data?.s?.replace(/USDT$/i, '').toLowerCase(); if (!symbol) return; const price = Number(data.c); const open = Number(data.o); pending.current[symbol] = { price, changePct: open > 0 ? ((price - open) / open) * 100 : 0 }; } catch {} };
+        socket.onclose = () => { if (closed) return; attempts += 1; setStatus('reconnecting'); timer = setTimeout(connect, Math.min(1000 * 2 ** attempts, 16000)); };
+      } catch { if (!closed) { attempts += 1; setStatus('offline'); timer = setTimeout(connect, Math.min(1000 * 2 ** attempts, 16000)); } }
     };
-
-    setup();
-    return () => { cancelled = true; ws?.close(); };
+    void connect();
+    return () => { closed = true; if (timer) clearTimeout(timer); socket?.close(); };
   }, [streamSymbols]);
 
-  useEffect(() => {
-    const flush = setInterval(() => {
-      const pending = pendingRef.current;
-      if (Object.keys(pending).length === 0) return;
-      pendingRef.current = {};
-      setCoins(prev => prev.map(c => pending[c.symbol] ? { ...c, ...pending[c.symbol] } : c));
-    }, 1000);
-    return () => clearInterval(flush);
-  }, []);
+  useEffect(() => { const flush = setInterval(() => { if (!Object.keys(pending.current).length) return; const updates = pending.current; pending.current = {}; setCoins((current) => current.map((coin) => updates[coin.symbol] ? { ...coin, ...updates[coin.symbol] } : coin)); }, 1000); return () => clearInterval(flush); }, []);
 
-  useEffect(() => {
-    if (user) fetchWatchlist();
-  }, [user]);
+  const fetchWatchlist = async () => { const { data, error } = await supabase.from('watchlist').select('*').order('created_at', { ascending: false }); if (!error) setWatchlist(data || []); };
+  useEffect(() => { if (user) void fetchWatchlist(); else setWatchlist([]); }, [user]);
+  const add = async (coin: Coin) => { if (!user) return; const { error } = await supabase.from('watchlist').insert({ user_id: user.id, coin_id: coin.id, name: coin.name, symbol: coin.symbol }); if (!error) void fetchWatchlist(); };
+  const remove = async (coinId: string) => { const { error } = await supabase.from('watchlist').delete().eq('coin_id', coinId); if (!error) void fetchWatchlist(); };
+  const price = (amount: number) => amount < 1 ? `$${amount.toFixed(4)}` : `$${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  const watched = (coinId: string) => watchlist.some((item) => item.coin_id === coinId);
 
-  const fetchWatchlist = async () => {
-    const { data } = await supabase
-      .from('watchlist')
-      .select('*')
-      .order('created_at', { ascending: false });
-    setWatchlist(data || []);
-  };
+  const visible = useMemo(() => {
+    const term = query.trim().toLowerCase(); const filtered = coins.filter((coin) => !term || coin.name.toLowerCase().includes(term) || coin.symbol.includes(term));
+    return [...filtered].sort((a, b) => sortBy === 'price-high' ? b.price - a.price : sortBy === 'price-low' ? a.price - b.price : sortBy === 'change-high' ? b.changePct - a.changePct : sortBy === 'change-low' ? a.changePct - b.changePct : coins.indexOf(a) - coins.indexOf(b));
+  }, [coins, query, sortBy]);
+  const leader = useMemo(() => coins.length ? [...coins].sort((a, b) => b.changePct - a.changePct)[0] : null, [coins]);
+  const laggard = useMemo(() => coins.length ? [...coins].sort((a, b) => a.changePct - b.changePct)[0] : null, [coins]);
+  const savedMarkets = watchlist.map((item) => coins.find((coin) => coin.id === item.coin_id)).filter(Boolean) as Coin[];
+  const savedLeader = savedMarkets.length ? [...savedMarkets].sort((a, b) => b.changePct - a.changePct)[0] : null;
+  const savedLaggard = savedMarkets.length ? [...savedMarkets].sort((a, b) => a.changePct - b.changePct)[0] : null;
+  const statusCopy = { live: ['Live stream', 'bg-emerald-300', 'border-emerald-300/20 bg-emerald-400/10 text-emerald-100'], connecting: ['Connecting', 'bg-amber-300', 'border-amber-300/20 bg-amber-400/10 text-amber-100'], reconnecting: ['Reconnecting', 'bg-amber-300', 'border-amber-300/20 bg-amber-400/10 text-amber-100'], offline: ['Stream offline', 'bg-red-300', 'border-red-300/20 bg-red-400/10 text-red-100'] }[status];
+  const changeNote = (coin: Coin | null | undefined, empty: string) => coin ? `${coin.changePct >= 0 ? '+' : ''}${coin.changePct.toFixed(2)}% current 24h change` : empty;
+  const changeTone = (coin: Coin | null | undefined, direction: 'up' | 'down') => coin && (direction === 'up' ? coin.changePct >= 0 : coin.changePct < 0) ? direction : undefined;
 
-  const addToWatchlist = async (coin: Coin) => {
-    if (!user) return;
-    const { error } = await supabase.from('watchlist').insert({
-      user_id: user.id,
-      coin_id: coin.id,
-      name: coin.name,
-      symbol: coin.symbol,
-    });
-    if (!error) fetchWatchlist();
-  };
-
-  const removeFromWatchlist = async (coinId: string) => {
-    const { error } = await supabase.from('watchlist').delete().eq('coin_id', coinId);
-    if (!error) fetchWatchlist();
-  };
-
-  const handleLogout = async () => {
-    await supabase.auth.signOut();
-  };
-
-  const inWatchlist = (coinId: string) => watchlist.some(w => w.coin_id === coinId);
-
-  const formatPrice = (price: number) => {
-    if (price < 1) return `$${price.toFixed(4)}`;
-    return `$${price.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
-  };
-
-  return (
-    <main className="min-h-screen bg-[#050505] text-white relative">
-      {/* Ambient Glow Background */}
-      <div className="fixed inset-0 pointer-events-none">
-        <div className="absolute -top-40 left-1/2 -translate-x-1/2 w-[900px] h-[500px] bg-orange-500/[0.07] blur-[140px] rounded-full" />
-        <div className="absolute top-1/3 -left-40 w-[400px] h-[400px] bg-blue-500/[0.05] blur-[120px] rounded-full" />
-        <div className="absolute bottom-0 -right-40 w-[500px] h-[400px] bg-purple-500/[0.05] blur-[120px] rounded-full" />
-        <div className="absolute inset-0 bg-[linear-gradient(to_right,rgba(255,255,255,0.025)_1px,transparent_1px),linear-gradient(to_bottom,rgba(255,255,255,0.025)_1px,transparent_1px)] bg-[size:56px_56px]" />
-      </div>
-
-      {/* Live Ticker Marquee */}
-      {!loading && coins.length > 0 && (
-        <div className="relative border-b border-white/5 bg-black/40 backdrop-blur-xl overflow-hidden py-2.5">
-          <div className="flex whitespace-nowrap animate-[marquee_40s_linear_infinite] w-max">
-            {[...coins, ...coins].map((c, i) => (
-              <span key={i} className="inline-flex items-center gap-2 px-6 text-xs">
-                <span className="text-white/50 font-semibold">{c.symbol.toUpperCase()}</span>
-                <span className="font-mono text-white/90">{formatPrice(c.price)}</span>
-                <span className={c.changePct >= 0 ? 'text-emerald-400' : 'text-red-400'}>
-                  {c.changePct >= 0 ? '▲' : '▼'} {Math.abs(c.changePct).toFixed(2)}%
-                </span>
-              </span>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Glass Header */}
-      <header className="sticky top-0 z-20 border-b border-white/5 bg-black/30 backdrop-blur-2xl">
-        <div className="max-w-5xl mx-auto px-4 py-4 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="relative">
-              <div className="absolute -inset-1 rounded-xl bg-orange-500/30 blur-md" />
-              <div className="relative w-10 h-10 rounded-xl bg-gradient-to-br from-orange-500 to-amber-600 flex items-center justify-center">
-                <TrendingUp className="w-5 h-5 text-white" />
-              </div>
-            </div>
-            <div>
-              <h1 className="text-lg font-semibold tracking-tight">CryptoWatch</h1>
-              <p className="text-[11px] text-white/40">Personal watchlist · Live data</p>
-            </div>
-          </div>
-          <div className="flex items-center gap-3">
-            {listLive && (
-              <span className="flex items-center gap-1.5 px-3 py-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/10 text-[11px] font-bold text-emerald-400">
-                <span className="relative flex h-1.5 w-1.5">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-                  <span className="relative inline-flex rounded-full h-1.5 w-1.5 bg-emerald-500"></span>
-                </span>
-                LIVE
-              </span>
-            )}
-            {user ? (
-              <>
-                <span className="hidden sm:block text-xs text-white/50 px-3 py-1.5 rounded-full border border-white/10 bg-white/5">
-                  {user.email}
-                </span>
-                <button onClick={handleLogout} className="p-2.5 rounded-xl border border-white/10 bg-white/5 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-400 transition-all">
-                  <LogOut className="w-4 h-4" />
-                </button>
-              </>
-            ) : (
-              <Link href="/auth" className="flex items-center gap-2 px-4 py-2 rounded-xl bg-white text-black font-semibold text-sm hover:bg-white/90 transition-all">
-                <LogIn className="w-4 h-4" /> Login
-              </Link>
-            )}
-          </div>
-        </div>
-      </header>
-
-      <div className="relative max-w-5xl mx-auto px-4 py-8">
-        {/* Hero (logged out) */}
-        {!user && (
-          <section className="text-center py-16 mb-8">
-            <div className="inline-flex items-center gap-2 px-4 py-1.5 rounded-full border border-white/10 bg-white/5 text-[11px] text-white/60 mb-6 backdrop-blur-xl">
-              <Sparkles className="w-3.5 h-3.5 text-orange-400" />
-              Real-time Binance WebSocket data
-            </div>
-            <h2 className="text-4xl sm:text-6xl font-bold tracking-tight bg-gradient-to-b from-white via-white to-white/30 bg-clip-text text-transparent mb-5">
-              Apni Crypto Watchlist
-              <br />
-              Banayein
-            </h2>
-            <p className="text-white/50 max-w-md mx-auto mb-9 leading-relaxed">
-              Login karein, apne favorite coins save karein, aur live prices + interactive charts dekhein.
-            </p>
-            <Link
-              href="/auth"
-              className="inline-flex items-center gap-2 px-8 py-3.5 rounded-xl bg-gradient-to-r from-orange-500 to-amber-600 font-bold shadow-xl shadow-orange-500/25 hover:shadow-orange-500/40 hover:scale-[1.02] transition-all"
-            >
-              Shuru Karein →
-            </Link>
-          </section>
-        )}
-
-        {/* Watchlist */}
-        {user && (
-          <section className="mb-10">
-            <h2 className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-white/40 mb-4">
-              <Star className="w-3.5 h-3.5 text-yellow-400 fill-yellow-400" /> Meri Watchlist
-            </h2>
-            {watchlist.length === 0 ? (
-              <div className="border border-dashed border-white/10 rounded-2xl p-10 text-center text-white/40 text-sm bg-white/[0.02]">
-                Watchlist khali hai - neeche coins par ⭐ daba kar add karein
-              </div>
-            ) : (
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                {watchlist.map(item => {
-                  const live = coins.find(c => c.id === item.coin_id);
-                  return (
-                    <div key={item.id} className="group bg-white/[0.03] border border-white/[0.06] rounded-2xl p-4 backdrop-blur-xl transition-all hover:bg-white/[0.06] hover:border-white/[0.12]">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 rounded-full bg-gradient-to-br from-white/10 to-white/5 border border-white/10 flex items-center justify-center text-[10px] font-bold text-white/80">
-                          {item.symbol.toUpperCase().slice(0, 4)}
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <h3 className="font-semibold text-sm truncate">{item.name}</h3>
-                          <p className="text-[11px] text-white/40 uppercase">{item.symbol}</p>
-                        </div>
-                        {live && (
-                          <div className="text-right">
-                            <p className="font-mono font-semibold text-sm">{formatPrice(live.price)}</p>
-                            <p className={`text-[11px] font-medium ${live.changePct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                              {live.changePct >= 0 ? '+' : ''}{live.changePct.toFixed(2)}%
-                            </p>
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex gap-2 mt-3 pt-3 border-t border-white/5">
-                        <Link href={`/coin/${item.coin_id}?symbol=${item.symbol}&name=${encodeURIComponent(item.name)}`} className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg bg-white/5 border border-white/10 text-[11px] font-semibold text-white/70 hover:bg-orange-500/10 hover:border-orange-500/30 hover:text-orange-400 transition-all">
-                          <BarChart3 className="w-3.5 h-3.5" /> Chart
-                        </Link>
-                        <button onClick={() => removeFromWatchlist(item.coin_id)} className="px-3 py-2 rounded-lg bg-white/5 border border-white/10 text-white/70 hover:bg-red-500/10 hover:border-red-500/30 hover:text-red-400 transition-all">
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-          </section>
-        )}
-
-        {/* Coins List */}
-        <section>
-          <h2 className="flex items-center gap-2 text-xs font-bold uppercase tracking-[0.2em] text-white/40 mb-4">
-            <span className="w-1.5 h-1.5 rounded-full bg-orange-500 animate-pulse" /> Top 20 · Live
-          </h2>
-          {loading ? (
-            <div className="space-y-3">
-              {[...Array(6)].map((_, i) => (
-                <div key={i} className="h-20 rounded-2xl bg-white/[0.03] border border-white/5 animate-pulse" />
-              ))}
-            </div>
-          ) : (
-            <div className="space-y-3">
-              {coins.map((coin, i) => (
-                <div key={coin.id} className="group bg-white/[0.03] border border-white/[0.06] rounded-2xl p-4 flex items-center gap-4 backdrop-blur-xl transition-all hover:bg-white/[0.06] hover:border-white/[0.12] hover:shadow-xl hover:shadow-orange-500/5">
-                  <span className="text-xs font-mono text-white/30 w-6">#{i + 1}</span>
-                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-white/10 to-white/5 border border-white/10 flex items-center justify-center text-[10px] font-bold text-white/80">
-                    {coin.symbol.toUpperCase().slice(0, 4)}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <h3 className="font-semibold text-sm truncate">{coin.name}</h3>
-                    <p className="text-[11px] text-white/40 uppercase">{coin.symbol}</p>
-                  </div>
-                  <div className="text-right">
-                    <p className="font-mono font-semibold">{formatPrice(coin.price)}</p>
-                    <span className={`inline-block mt-1 px-2 py-0.5 rounded-md text-[11px] font-medium ${coin.changePct >= 0 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/10 text-red-400'}`}>
-                      {coin.changePct >= 0 ? '+' : ''}{coin.changePct.toFixed(2)}%
-                    </span>
-                  </div>
-                  <div className="flex gap-2">
-                    <Link href={`/coin/${coin.id}?symbol=${coin.symbol}&name=${encodeURIComponent(coin.name)}`} className="p-2.5 rounded-xl border border-white/10 bg-white/5 text-white/50 hover:text-orange-400 hover:border-orange-500/30 hover:bg-orange-500/10 transition-all">
-                      <BarChart3 className="w-4 h-4" />
-                    </Link>
-                    {user && (
-                      <button
-                        onClick={() => inWatchlist(coin.id) ? removeFromWatchlist(coin.id) : addToWatchlist(coin)}
-                        className={`p-2.5 rounded-xl border transition-all ${
-                          inWatchlist(coin.id)
-                            ? 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10'
-                            : 'text-white/50 border-white/10 bg-white/5 hover:text-yellow-400 hover:border-yellow-500/30'
-                        }`}
-                      >
-                        <Star className={`w-4 h-4 ${inWatchlist(coin.id) ? 'fill-yellow-400' : ''}`} />
-                      </button>
-                    )}
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
-      </div>
-    </main>
-  );
+  return <main className="signal-shell min-h-screen overflow-x-hidden bg-[#050507] text-white">
+    <div className="signal-grid" aria-hidden="true" /><div className="signal-glow signal-amber" aria-hidden="true" /><div className="signal-glow signal-blue" aria-hidden="true" />
+    {!loading && coins.length > 0 && <div className="relative z-20 overflow-hidden border-b border-white/[.06] bg-black/35 py-2 backdrop-blur-xl"><div className="signal-ticker flex w-max whitespace-nowrap">{[...coins, ...coins].map((coin, index) => <span key={`${coin.id}-${index}`} className="inline-flex items-center gap-2 px-5 text-[11px]"><b className="text-white/65">{coin.symbol.toUpperCase()}</b><span className="font-mono text-white/85">{price(coin.price)}</span><span className={coin.changePct >= 0 ? 'text-emerald-300' : 'text-red-300'}>{coin.changePct >= 0 ? '▲' : '▼'} {Math.abs(coin.changePct).toFixed(2)}%</span></span>)}</div></div>}
+    <header className="relative z-20 border-b border-white/[.06] bg-[#050507]/70 backdrop-blur-2xl"><div className="mx-auto flex max-w-7xl items-center justify-between px-5 py-4 sm:px-8"><div className="flex items-center gap-3"><div className="relative flex h-10 w-10 items-center justify-center rounded-xl border border-amber-200/20 bg-gradient-to-br from-amber-400 to-orange-600 shadow-[0_0_28px_rgba(251,146,60,.26)]"><TrendingUp className="h-5 w-5" /><span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full border-2 border-[#050507] bg-emerald-300" /></div><div><p className="font-semibold tracking-tight">CryptoWatch</p><p className="text-[10px] uppercase tracking-[.16em] text-white/40">Signal Desk</p></div></div><div className="flex items-center gap-3"><span className={`hidden items-center gap-2 rounded-full border px-3 py-1.5 text-[11px] font-semibold sm:flex ${statusCopy[2]}`}><span className={`h-1.5 w-1.5 rounded-full ${statusCopy[1]} ${status === 'live' ? 'animate-pulse' : ''}`} />{statusCopy[0]}</span>{user ? <><span className="hidden rounded-full border border-white/10 bg-white/[.035] px-3 py-1.5 text-xs text-white/50 md:block">{user.email}</span><button onClick={() => supabase.auth.signOut()} aria-label="Log out" className="rounded-xl border border-white/10 bg-white/[.035] p-2.5 text-white/70 transition hover:border-red-300/30 hover:bg-red-400/[.08] hover:text-red-200"><LogOut className="h-4 w-4" /></button></> : <Link href="/auth" className="inline-flex items-center gap-2 rounded-xl bg-white px-4 py-2 text-sm font-bold text-black transition hover:bg-amber-50"><LogIn className="h-4 w-4" />Sign in</Link>}</div></div></header>
+    <div className="relative z-10 mx-auto max-w-7xl px-5 pb-12 sm:px-8">
+      {!user && <section className="grid min-w-0 items-center gap-10 py-14 lg:grid-cols-[1.02fr_.98fr] lg:py-20"><div className="min-w-0"><div className="signal-enter inline-flex items-center gap-2 rounded-full border border-amber-200/15 bg-amber-300/[.07] px-3 py-1.5 text-xs font-semibold text-amber-100"><Sparkles className="h-3.5 w-3.5 text-amber-300" />Personal market intelligence</div><h1 className="signal-headline signal-enter signal-d1 mt-6 max-w-2xl text-5xl font-semibold leading-[.95] tracking-[-.055em] sm:text-6xl lg:text-7xl">A personal command center for the <span className="bg-gradient-to-r from-amber-200 via-orange-300 to-yellow-100 bg-clip-text text-transparent">crypto you actually follow.</span></h1><p className="signal-enter signal-d2 mt-6 max-w-xl text-base leading-7 text-white/58 sm:text-lg">Build a private watchlist, inspect real-time market moves, and open focused price charts without pretending to be a trading terminal.</p><div className="signal-enter signal-d3 mt-8 flex flex-wrap gap-3"><Link href="/auth" className="group inline-flex items-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 via-orange-500 to-amber-500 px-5 py-3.5 font-bold text-black shadow-xl shadow-orange-500/20 transition hover:-translate-y-0.5"><Activity className="h-5 w-5" />Build a watchlist<ArrowRight className="h-5 w-5 transition-transform group-hover:translate-x-1" /></Link><a href="#market" className="inline-flex items-center gap-2 rounded-2xl border border-white/12 bg-white/[.035] px-5 py-3.5 font-bold text-white/80 transition hover:border-amber-200/30 hover:bg-white/[.07]">Explore market<ArrowRight className="h-4 w-4" /></a></div><p className="signal-enter signal-d4 mt-6 flex items-center gap-2 text-xs text-white/42"><ShieldCheck className="h-4 w-4 text-amber-300" />Market-data learning project. Not trading, custody, or investment advice.</p></div><div className="signal-enter signal-d2 relative min-w-0"><div className="signal-terminal relative overflow-hidden rounded-[2rem] border border-white/10 bg-gradient-to-br from-white/[.09] to-white/[.02] p-5 shadow-2xl shadow-black/40 sm:p-7"><div className="absolute inset-0 bg-[radial-gradient(circle_at_65%_25%,rgba(251,146,60,.22),transparent_24%),radial-gradient(circle_at_14%_82%,rgba(59,130,246,.13),transparent_28%)]" /><div className="relative flex items-center justify-between"><div><p className="text-[11px] font-semibold uppercase tracking-[.16em] text-white/40">Realtime market pulse</p><p className="mt-1 text-sm font-semibold text-white/85">Top 20 · public stream</p></div><span className={`flex items-center gap-2 rounded-full border px-2.5 py-1 text-[10px] font-bold ${statusCopy[2]}`}><span className={`h-1.5 w-1.5 rounded-full ${statusCopy[1]}`} />{statusCopy[0]}</span></div><div className="signal-chart relative mt-7 h-32 overflow-hidden rounded-2xl border border-amber-200/10 bg-black/20" /><div className="relative mt-5 grid grid-cols-3 gap-2">{['Personal watchlists','Streaming prices','Historical charts'].map((label, index) => <div key={label} className="rounded-xl border border-white/10 bg-black/25 p-3"><span className="text-amber-200/80">0{index + 1}</span><p className="mt-2 text-[11px] font-medium text-white/75">{label}</p></div>)}</div></div></div></section>}
+      {user && <section className="grid gap-3 py-8 sm:grid-cols-3"><Metric title="Private watchlist" value={String(watchlist.length)} note={`saved asset${watchlist.length === 1 ? '' : 's'}`} /><Metric title="Watchlist leader" value={savedLeader?.symbol.toUpperCase() || '—'} note={changeNote(savedLeader, 'Add a coin to compare')} tone={changeTone(savedLeader, 'up')} /><Metric title="Watchlist laggard" value={savedLaggard?.symbol.toUpperCase() || '—'} note={changeNote(savedLaggard, 'No saved market data yet')} tone={changeTone(savedLaggard, 'down')} /></section>}
+      {user && <section className="mb-10"><div className="mb-4 flex items-center justify-between"><h2 className="flex items-center gap-2 text-xs font-bold uppercase tracking-[.2em] text-white/42"><Star className="h-3.5 w-3.5 fill-amber-300 text-amber-300" />My watchlist</h2><span className="text-xs text-white/40">Account-scoped saved assets</span></div>{watchlist.length === 0 ? <div className="rounded-2xl border border-dashed border-white/15 bg-white/[.02] p-8 text-center text-sm text-white/45">Your watchlist is empty. Use the star button below to save an asset.</div> : <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">{watchlist.map((item) => { const coin = coins.find((value) => value.id === item.coin_id); return <div key={item.id} className="rounded-2xl border border-white/10 bg-white/[.035] p-4"><div className="flex items-center gap-3"><div className="flex h-10 w-10 items-center justify-center rounded-full border border-white/10 bg-white/[.05] text-xs font-bold">{item.symbol.toUpperCase().slice(0,4)}</div><div className="min-w-0 flex-1"><p className="truncate font-semibold">{item.name}</p><p className="text-xs uppercase text-white/40">{item.symbol}</p></div>{coin && <div className="text-right"><p className="font-mono text-sm">{price(coin.price)}</p><p className={coin.changePct >= 0 ? 'text-xs text-emerald-300' : 'text-xs text-red-300'}>{coin.changePct >= 0 ? '+' : ''}{coin.changePct.toFixed(2)}%</p></div>}</div><div className="mt-4 flex gap-2 border-t border-white/[.07] pt-3"><Link href={`/coin/${item.coin_id}?symbol=${item.symbol}&name=${encodeURIComponent(item.name)}`} className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-white/[.05] py-2 text-xs font-semibold text-white/75 transition hover:bg-amber-400/10 hover:text-amber-100"><BarChart3 className="h-3.5 w-3.5" />Chart</Link><button onClick={() => remove(item.coin_id)} aria-label={`Remove ${item.name}`} className="rounded-lg border border-white/10 px-3 text-white/55 transition hover:border-red-300/30 hover:bg-red-400/[.08] hover:text-red-200"><Trash2 className="h-3.5 w-3.5" /></button></div></div>; })}</div>}</section>}
+      <section id="market" className="scroll-mt-6 pb-8"><div className="mb-5 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between"><div><p className="flex items-center gap-2 text-xs font-bold uppercase tracking-[.2em] text-amber-200/70"><Network className="h-3.5 w-3.5" />Public market lens</p><h2 className="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">Explore live market context.</h2><p className="mt-2 max-w-xl text-sm leading-6 text-white/48">Search and sort the loaded top-market data. Movement labels describe current data; they are not recommendations.</p></div><button onClick={() => void loadCoins()} className="inline-flex items-center justify-center gap-2 rounded-xl border border-white/12 bg-white/[.035] px-3.5 py-2.5 text-sm font-semibold text-white/75 transition hover:border-amber-200/35 hover:bg-amber-300/[.08]"><RefreshCw className={`h-4 w-4 ${loading ? 'animate-spin' : ''}`} />Refresh data</button></div><div className="mb-4 grid gap-3 lg:grid-cols-[1fr_auto]"><label className="relative block"><Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/38" /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search loaded assets by name or ticker" className="w-full rounded-xl border border-white/10 bg-black/20 py-3 pl-10 pr-4 text-sm outline-none transition placeholder:text-white/30 focus:border-amber-200/50 focus:ring-4 focus:ring-amber-300/10" /></label><label className="relative"><ArrowUpDown className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-white/38" /><select value={sortBy} onChange={(event) => setSortBy(event.target.value as SortKey)} className="w-full appearance-none rounded-xl border border-white/10 bg-[#101014] py-3 pl-10 pr-9 text-sm text-white outline-none focus:border-amber-200/50">{Object.entries(sortLabels).map(([value,label]) => <option key={value} value={value}>{label}</option>)}</select></label></div>{!loading && coins.length > 0 && <div className="mb-5 grid gap-3 sm:grid-cols-2"><Mover label="Top mover" coin={leader} direction="up" /><Mover label="Lowest mover" coin={laggard} direction="down" /></div>}{marketError ? <div className="rounded-2xl border border-red-300/20 bg-red-400/[.07] p-5 text-sm text-red-100"><div className="flex items-start gap-3"><CircleAlert className="mt-0.5 h-5 w-5 shrink-0 text-red-300" /><div><p className="font-semibold">Market data unavailable</p><p className="mt-1 text-red-100/70">{marketError}</p><button onClick={() => void loadCoins()} className="mt-3 inline-flex items-center gap-2 rounded-lg border border-red-200/25 px-3 py-2 text-xs font-bold transition hover:bg-red-300/10"><RefreshCw className="h-3.5 w-3.5" />Try again</button></div></div></div> : loading ? <div className="space-y-3">{Array.from({length:6}).map((_,index) => <div key={index} className="h-20 animate-pulse rounded-2xl border border-white/[.04] bg-white/[.03]" />)}</div> : visible.length === 0 ? <div className="rounded-2xl border border-dashed border-white/15 p-8 text-center text-sm text-white/45">No loaded asset matches “{query}”. Try another ticker or clear the search.</div> : <div className="space-y-3">{visible.map((coin) => <CoinRow key={coin.id} coin={coin} rank={coins.indexOf(coin) + 1} price={price} user={user} watched={watched(coin.id)} onAdd={() => add(coin)} onRemove={() => remove(coin.id)} />)}</div>}</section>
+      {!user && <section className="grid gap-3 border-t border-white/[.07] py-10 sm:grid-cols-3">{[['01','Create a private account','Email/password auth routes your saved list to your own session.'],['02','Star the assets you follow','Store the coins you want to revisit in a personal watchlist.'],['03','Open a focused coin view','Inspect live price context and a selectable historical chart.']].map(([number,title,note]) => <div key={number} className="rounded-2xl border border-white/10 bg-white/[.025] p-5"><span className="font-mono text-amber-200/80">{number}</span><h3 className="mt-4 font-semibold">{title}</h3><p className="mt-2 text-sm leading-6 text-white/48">{note}</p></div>)}</section>}
+      <footer className="border-t border-white/[.07] py-6 text-center text-xs text-white/35">CryptoWatch is a market-data learning project. It does not provide trading, custody, or investment advice.</footer>
+    </div>
+  </main>;
 }
+
+function Metric({ title, value, note, tone }: { title: string; value: string; note: string; tone?: 'up'|'down' }) { return <div className="rounded-2xl border border-white/10 bg-white/[.035] p-5"><p className="text-xs font-semibold uppercase tracking-[.14em] text-white/40">{title}</p><p className="mt-3 text-3xl font-semibold">{value}</p><p className={`mt-1 text-xs ${tone === 'up' ? 'text-emerald-300' : tone === 'down' ? 'text-red-300' : 'text-white/45'}`}>{note}</p></div>; }
+function Mover({ label, coin, direction }: { label: string; coin: Coin | null; direction: 'up'|'down' }) { const up = direction === 'up'; return <div className="flex items-center justify-between rounded-2xl border border-white/10 bg-white/[.035] p-4"><div><p className="text-xs font-semibold uppercase tracking-[.15em] text-white/40">{label}</p><p className="mt-2 font-semibold">{coin ? `${coin.name} · ${coin.symbol.toUpperCase()}` : 'Waiting for market data'}</p></div><div className={`flex items-center gap-2 text-sm font-semibold ${up ? 'text-emerald-300' : 'text-red-300'}`}>{up ? <TrendingUp className="h-4 w-4" /> : <TrendingDown className="h-4 w-4" />}{coin ? `${coin.changePct >= 0 ? '+' : ''}${coin.changePct.toFixed(2)}%` : '—'}</div></div>; }
+function CoinRow({ coin, rank, price, user, watched, onAdd, onRemove }: { coin: Coin; rank: number; price: (value: number) => string; user: any; watched: boolean; onAdd: () => void; onRemove: () => void }) { return <div className="group flex items-center gap-3 rounded-2xl border border-white/[.08] bg-white/[.03] p-3.5 transition hover:border-amber-200/20 hover:bg-white/[.055] sm:gap-4"><span className="w-7 font-mono text-xs text-white/30">#{rank}</span><div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-white/10 bg-white/[.05] text-[10px] font-bold">{coin.symbol.toUpperCase().slice(0,4)}</div><div className="min-w-0 flex-1"><p className="truncate text-sm font-semibold">{coin.name}</p><p className="text-[11px] uppercase text-white/40">{coin.symbol}</p></div><div className="text-right"><p className="font-mono text-sm font-semibold">{price(coin.price)}</p><p className={coin.changePct >= 0 ? 'text-xs text-emerald-300' : 'text-xs text-red-300'}>{coin.changePct >= 0 ? '+' : ''}{coin.changePct.toFixed(2)}%</p></div><div className="flex gap-2"><Link href={`/coin/${coin.id}?symbol=${coin.symbol}&name=${encodeURIComponent(coin.name)}`} aria-label={`Open ${coin.name} chart`} className="rounded-xl border border-white/10 bg-white/[.04] p-2.5 text-white/55 transition hover:border-amber-200/30 hover:bg-amber-300/[.08] hover:text-amber-100"><BarChart3 className="h-4 w-4" /></Link>{user && <button onClick={watched ? onRemove : onAdd} aria-label={watched ? `Remove ${coin.name}` : `Add ${coin.name}`} className={watched ? 'rounded-xl border border-amber-300/30 bg-amber-300/10 p-2.5 text-amber-200' : 'rounded-xl border border-white/10 bg-white/[.04] p-2.5 text-white/55 transition hover:border-amber-200/30 hover:text-amber-100'}><Star className={`h-4 w-4 ${watched ? 'fill-amber-200' : ''}`} /></button>}</div></div>; }

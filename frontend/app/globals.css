@@ -1,17 +1,6 @@
 @import "tailwindcss";
-
-@keyframes marquee {
-  0% { transform: translateX(0); }
-  100% { transform: translateX(-50%); }
-}
-
-::-webkit-scrollbar {
-  width: 8px;
-}
-::-webkit-scrollbar-track {
-  background: #0a0a0a;
-}
-::-webkit-scrollbar-thumb {
-  background: #27272a;
-  border-radius: 4px;
-}
+:root { --background: #050507; --foreground: #f8fafc; }
+* { box-sizing: border-box; }
+html,body { margin: 0; background: var(--background); color: var(--foreground); }
+body { font-family: Arial, Helvetica, sans-serif; }
+.signal-shell { isolation: isolate; }.signal-grid { position: fixed; inset: 0; z-index: -3; opacity: .44; background-image: linear-gradient(rgba(255,255,255,.027) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.027) 1px,transparent 1px); background-size: 52px 52px; mask-image: radial-gradient(circle at 48% 30%,black,transparent 78%); }.signal-glow { position: fixed; z-index: -2; border-radius: 999px; filter: blur(90px); pointer-events: none; animation: signal-drift 15s ease-in-out infinite alternate; }.signal-amber { top: -13rem; left: 18%; width: 36rem; height: 25rem; background: rgba(249,115,22,.19); }.signal-blue { right: -10rem; bottom: 5%; width: 31rem; height: 31rem; background: rgba(37,99,235,.13); animation-delay: -7s; }.signal-ticker { animation: signal-marquee 48s linear infinite; }.signal-enter { animation: signal-enter 650ms cubic-bezier(.23,1,.32,1) both; }.signal-d1 { animation-delay: 80ms; }.signal-d2 { animation-delay: 150ms; }.signal-d3 { animation-delay: 220ms; }.signal-d4 { animation-delay: 290ms; }.signal-terminal { animation: signal-float 7s ease-in-out infinite; }.signal-chart::before { content:""; position:absolute; inset: 20px; background: linear-gradient(140deg,transparent 0 9%,rgba(251,191,36,.25) 9.5% 10.5%,transparent 11% 22%,rgba(251,146,60,.8) 22.5% 23.5%,transparent 24% 38%,rgba(250,204,21,.75) 38.5% 39.5%,transparent 40% 53%,rgba(251,146,60,.85) 53.5% 54.5%,transparent 55% 67%,rgba(253,186,116,.6) 67.5% 68.5%,transparent 69%); transform:skewY(-8deg); filter:drop-shadow(0 0 7px rgba(251,146,60,.5)); } @keyframes signal-marquee { from { transform:translateX(0); } to { transform:translateX(-50%); } } @keyframes signal-enter { from { opacity:0; transform:translateY(16px) scale(.985); } to { opacity:1; transform:translateY(0) scale(1); } } @keyframes signal-drift { from { transform:translate3d(-3%,-2%,0) scale(.96); opacity:.6; } to { transform:translate3d(5%,5%,0) scale(1.08); opacity:1; } } @keyframes signal-float { 0%,100% { transform:translateY(-4px); } 50% { transform:translateY(7px); } } @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration:.01ms !important; animation-iteration-count:1 !important; scroll-behavior:auto !important; } } @media (max-width:640px) { .signal-grid { background-size:40px 40px; }.signal-glow { filter:blur(70px); }.signal-headline { font-size:clamp(2.45rem,11vw,3.2rem); } }
